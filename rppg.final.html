@@ -188,359 +188,348 @@ video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:block
 
 <script>
 // ═══════════════════════════════════════════════════════════════════
-//  rPPG ENGINE
-//  Pipeline:
-//    1. ROI extraction → spatial avg of green channel (forehead only)
-//    2. Detrend (sliding-window mean subtraction, 2s window)
-//    3. Normalize (zero-mean, unit variance)
-//    4. Hann-windowed DFT → dominant frequency → raw BPM
-//    5. Harmonic correction (sub-harmonic lock fix)
-//    6. Adaptive R-peak detection → inter-beat intervals → peak BPM
-//    7. Motion detection (frame-diff on ROI) → freeze BPM if moving
-//    8. SQI = peak prominence ratio (dominant / mean spectrum)
-//    9. BPM smoothing: trimmed moving average of last 7 values
-//   10. Cross-validate FFT vs peak BPM → final estimate + confidence
+//  rPPG ENGINE — Stability-first rewrite
+//
+//  Key fixes vs previous version:
+//  1. Canvas size set ONCE on start, not every frame (eliminates jitter)
+//  2. Separate offscreen canvas for pixel sampling (no redraw artifacts)
+//  3. Detrend window = 5s (not 2s — 2s distorted the heartbeat signal)
+//  4. Process only every 30 frames (once/sec) — more data, less noise
+//  5. BPM history window = 12, trimmed mean drops top+bottom 25%
+//  6. Only update displayed BPM if new estimate within ±15 of current
+//     (outlier gate — rejects single bad estimates)
+//  7. Motion detection uses 5-frame rolling average, not single-frame diff
 // ═══════════════════════════════════════════════════════════════════
 
 const MIN_BPM   = 45;
 const MAX_BPM   = 180;
-const CAL_SECS  = 10;       // calibration period
-const MAX_BUF   = 900;      // ~30s at 30fps
-const BPM_HIST  = 7;        // smoothing window
-const MOTION_TH = 0.004;    // motion detection threshold (mean abs diff)
+const CAL_SECS  = 10;
+const MAX_BUF   = 1200;   // 40s at 30fps
+const BPM_HIST  = 12;     // smoothing window (larger = more stable)
+const MOTION_TH = 0.006;  // mean abs green diff threshold
 
 let running = false, calDone = false;
 let stream = null, raf = null;
 
-// Buffers
-let gBuf  = [];   // green channel mean per frame [0–1]
-let tBuf  = [];   // timestamps ms
-let prevRoi = null; // for motion detection
+// Signal buffers
+let gBuf    = [];  // green mean per frame [0–1]
+let tBuf    = [];  // timestamps ms
+
+// Motion: rolling 5-frame diffs
+let motionHistory = [];
+let prevGreenMean = null;
 
 // Outputs
-let bpmSmooth  = 0;
-let bpmHistory = [];   // last N raw estimates for smoothing
-let hrv        = 0;
-let sqi        = 0;    // 0–1
-let confidence = 0;    // 0–100
-let peakCount  = 0;
-let motionFlag = false;
-let lastPeaks  = [];   // indices of last detected R-peaks (for waveform)
+let bpmDisplay  = 0;   // what's shown — only updated when stable
+let bpmHistory  = [];
+let hrv         = 0;
+let sqi         = 0;
+let confidence  = 0;
+let peakCount   = 0;
+let motionFlag  = false;
+let lastPeakIdx = [];   // for waveform only
 
 // FPS
 let fpsCount = 0, fpsLast = 0, fpsCur = 0;
-
-// Beat animation
 let lastBeat = 0;
 
-// DOM
-const video   = document.getElementById('video');
-const oc      = document.getElementById('overlay');
-const octx    = oc.getContext('2d', { willReadFrequently: true });
-const wc      = document.getElementById('waveCanvas');
-const wctx    = wc.getContext('2d');
+// DOM refs
+const video = document.getElementById('video');
+const oc    = document.getElementById('overlay');
+const octx  = oc.getContext('2d', { willReadFrequently: true });
+const wc    = document.getElementById('waveCanvas');
+const wctx  = wc.getContext('2d');
+
+// Offscreen canvas for clean pixel sampling (no overlay pollution)
+const offscreen = document.createElement('canvas');
+const offCtx    = offscreen.getContext('2d', { willReadFrequently: true });
 
 // ─────────────────────────────────────────────────────────
-//  DSP HELPERS
+//  DSP
 // ─────────────────────────────────────────────────────────
 
-// Sliding-window detrend: removes slow DC drift
-function detrend(sig, winSamples) {
-  const half = Math.floor(winSamples / 2);
+// Detrend with 5-second window — long enough to not eat heartbeat signal
+function detrend(sig, fps) {
+  const half = Math.floor(fps * 2.5); // 5s window
   return sig.map((v, i) => {
-    let s = 0, c = 0;
     const lo = Math.max(0, i - half), hi = Math.min(sig.length - 1, i + half);
+    let s = 0, c = 0;
     for (let j = lo; j <= hi; j++) { s += sig[j]; c++; }
     return v - s / c;
   });
 }
 
-// Hann window
 function hann(sig) {
   const N = sig.length;
   return sig.map((v, i) => v * 0.5 * (1 - Math.cos(2 * Math.PI * i / (N - 1))));
 }
 
-// DFT magnitude — computed only in BPM frequency range
-// Returns array of {freq, mag}
+// DFT in HR range only — returns {freq, mag}[]
 function dft(sig, fps) {
-  const N    = sig.length;
-  const kLo  = Math.max(1, Math.floor(MIN_BPM / 60 * N / fps));
-  const kHi  = Math.min(Math.floor(N / 2), Math.ceil(MAX_BPM / 60 * N / fps));
-  const out  = [];
+  const N   = sig.length;
+  const kLo = Math.max(1, Math.floor(MIN_BPM / 60 * N / fps));
+  const kHi = Math.min(Math.floor(N / 2), Math.ceil(MAX_BPM / 60 * N / fps));
+  const out = [];
   for (let k = kLo; k <= kHi; k++) {
     let re = 0, im = 0;
     const w = 2 * Math.PI * k / N;
-    for (let n = 0; n < N; n++) { re += sig[n] * Math.cos(w * n); im -= sig[n] * Math.sin(w * n); }
+    for (let n = 0; n < N; n++) {
+      re += sig[n] * Math.cos(w * n);
+      im -= sig[n] * Math.sin(w * n);
+    }
     out.push({ freq: k * fps / N, mag: Math.hypot(re, im) });
   }
   return out;
 }
 
-// Signal Quality Index: ratio of dominant peak to mean spectrum
-// SQI > 3 = clean; < 1.5 = noisy
-function computeSQI(spectrum) {
-  if (!spectrum.length) return 0;
-  const mags  = spectrum.map(s => s.mag);
-  const peak  = Math.max(...mags);
-  const mean  = mags.reduce((a,b)=>a+b,0) / mags.length;
-  return mean > 0 ? Math.min(1, (peak / mean - 1) / 9) : 0; // normalise 0–1
+// SQI: dominant peak energy vs mean — higher = cleaner signal
+function calcSQI(spec) {
+  if (!spec.length) return 0;
+  const mags = spec.map(s => s.mag);
+  const peak = Math.max(...mags);
+  const mean = mags.reduce((a,b)=>a+b,0) / mags.length;
+  // ratio of 10+ means very clean; 1 = flat noise
+  return Math.min(1, (peak / (mean || 1) - 1) / 12);
 }
 
-// Harmonic correction: if FFT locks onto f/2 sub-harmonic, double it
-function fixHarmonic(fftBPM, peakBPM) {
-  if (fftBPM < 65) {
-    const doubled = fftBPM * 2;
-    if (doubled >= MIN_BPM && doubled <= MAX_BPM) {
-      // Accept double if peakBPM agrees, or if no peak estimate available
-      if (peakBPM === 0 || Math.abs(doubled - peakBPM) < Math.abs(fftBPM - peakBPM)) {
-        return doubled;
-      }
+// Sub-harmonic correction
+function fixHarmonic(f, peakBPM) {
+  if (f < 65) {
+    const d = f * 2;
+    if (d >= MIN_BPM && d <= MAX_BPM) {
+      if (peakBPM === 0 || Math.abs(d - peakBPM) < Math.abs(f - peakBPM)) return d;
     }
   }
-  return fftBPM;
+  return f;
 }
 
-// Adaptive R-peak detection on normalised signal
-// Uses local adaptive threshold + refractory period
-function detectRPeaks(norm, fps) {
-  // Adaptive threshold: 60th percentile of absolute values
-  const sorted = [...norm].sort((a,b) => a - b);
-  const thresh = sorted[Math.floor(sorted.length * 0.60)];
-  const refractory = Math.round(fps * 0.28); // 280ms
-
-  const peaks = [];
+// R-peak detection: adaptive threshold, 300ms refractory
+function detectPeaks(norm, fps) {
+  const sorted  = [...norm].sort((a,b) => a - b);
+  // 65th percentile as threshold (slightly higher = fewer false positives)
+  const thresh  = sorted[Math.floor(sorted.length * 0.65)];
+  const refract = Math.round(fps * 0.30);
+  const peaks   = [];
   for (let i = 2; i < norm.length - 2; i++) {
     if (norm[i] > thresh &&
         norm[i] > norm[i-1] && norm[i] > norm[i+1] &&
         norm[i] > norm[i-2] && norm[i] > norm[i+2]) {
-      if (!peaks.length || i - peaks[peaks.length-1] > refractory) {
-        peaks.push(i);
-      }
+      if (!peaks.length || i - peaks[peaks.length-1] > refract) peaks.push(i);
     }
   }
   return peaks;
 }
 
-// Trimmed moving average BPM smoother
-// Drops highest and lowest values before averaging
-function smoothBPM(raw) {
-  bpmHistory.push(raw);
-  if (bpmHistory.length > BPM_HIST) bpmHistory.shift();
-  if (bpmHistory.length < 3) return raw;
-  const sorted = [...bpmHistory].sort((a,b)=>a-b);
-  // Trim 1 from each end
-  const trimmed = sorted.slice(1, sorted.length - 1);
-  return trimmed.reduce((a,b)=>a+b,0) / trimmed.length;
+// Trimmed mean: discard top + bottom 25% of history
+function trimmedMean(arr) {
+  if (arr.length < 4) return arr.reduce((a,b)=>a+b,0)/arr.length;
+  const s   = [...arr].sort((a,b)=>a-b);
+  const cut = Math.floor(s.length * 0.25);
+  const mid = s.slice(cut, s.length - cut);
+  return mid.reduce((a,b)=>a+b,0) / mid.length;
 }
 
 // ─────────────────────────────────────────────────────────
-//  MOTION DETECTION
+//  MOTION DETECTION — rolling 5-frame green mean diff
 // ─────────────────────────────────────────────────────────
-function checkMotion(currentRoi) {
-  if (!prevRoi || prevRoi.length !== currentRoi.length) {
-    prevRoi = currentRoi;
-    return false;
+function checkMotion(greenMean) {
+  if (prevGreenMean !== null) {
+    motionHistory.push(Math.abs(greenMean - prevGreenMean));
+    if (motionHistory.length > 5) motionHistory.shift();
   }
-  let diff = 0;
-  const step = 4; // sample every 4th pixel for speed
-  let count = 0;
-  for (let i = 1; i < currentRoi.length; i += step * 4) {
-    diff += Math.abs(currentRoi[i] - prevRoi[i]) / 255;
-    count++;
-  }
-  prevRoi = currentRoi;
-  return count > 0 ? (diff / count) > MOTION_TH : false;
+  prevGreenMean = greenMean;
+  const avg = motionHistory.length
+    ? motionHistory.reduce((a,b)=>a+b,0) / motionHistory.length : 0;
+  return avg > MOTION_TH;
 }
 
 // ─────────────────────────────────────────────────────────
-//  MAIN SIGNAL PROCESSOR
+//  MAIN PROCESSOR — runs once per second (every 30 frames)
 // ─────────────────────────────────────────────────────────
 function process() {
   const N = gBuf.length;
-  if (N < 30) return;
+  if (N < 60) return;
 
-  // Real FPS from timestamps
+  // Real FPS
   const tSpan = tBuf[N-1] - tBuf[0];
-  const fps = (N - 1) / (tSpan / 1000);
-  if (fps < 5 || fps > 120) return;
+  const fps   = (N - 1) / (tSpan / 1000);
+  if (fps < 8 || fps > 120) return;
 
-  // Use last 10 seconds of data
-  const useN = Math.min(N, Math.round(fps * 10));
+  // Use last 15 seconds (more data = better frequency resolution)
+  const useN = Math.min(N, Math.round(fps * 15));
   const raw  = gBuf.slice(-useN);
 
-  // 1. Detrend (2-second window)
-  const det = detrend(raw, Math.round(fps * 2));
+  // 1. Detrend
+  const det = detrend(raw, fps);
 
   // 2. Normalize
-  const mu   = det.reduce((a,b)=>a+b,0) / det.length;
-  const sig2 = Math.sqrt(det.reduce((a,b)=>a+(b-mu)**2,0) / det.length);
-  if (sig2 < 0.00005) return; // signal too flat
-  const norm = det.map(v => (v - mu) / sig2);
+  const mu  = det.reduce((a,b)=>a+b,0) / det.length;
+  const std = Math.sqrt(det.reduce((a,b)=>a+(b-mu)**2,0) / det.length);
+  if (std < 0.00003) return; // truly flat — covered lens or no face
+  const norm = det.map(v => (v - mu) / std);
 
-  // 3. FFT → dominant frequency
-  const windowed = hann(norm);
-  const spectrum = dft(windowed, fps);
-  if (!spectrum.length) return;
+  // 3. Hann + DFT
+  const spec    = dft(hann(norm), fps);
+  if (!spec.length) return;
+  sqi = calcSQI(spec);
 
-  // SQI from spectrum
-  sqi = computeSQI(spectrum);
-
-  // Find peak bin
-  let bestIdx = 0;
-  for (let i = 1; i < spectrum.length; i++) {
-    if (spectrum[i].mag > spectrum[bestIdx].mag) bestIdx = i;
-  }
-
-  // Parabolic interpolation for sub-bin frequency accuracy
-  let peakFreq = spectrum[bestIdx].freq;
-  if (bestIdx > 0 && bestIdx < spectrum.length - 1) {
-    const L = spectrum[bestIdx-1].mag, C = spectrum[bestIdx].mag, R = spectrum[bestIdx+1].mag;
+  // Dominant bin + parabolic interpolation
+  let bi = 0;
+  for (let i = 1; i < spec.length; i++) if (spec[i].mag > spec[bi].mag) bi = i;
+  let pFreq = spec[bi].freq;
+  if (bi > 0 && bi < spec.length - 1) {
+    const L = spec[bi-1].mag, C = spec[bi].mag, R = spec[bi+1].mag;
     const d = L - 2*C + R;
     if (d < 0) {
-      const df = spectrum.length > 1 ? spectrum[1].freq - spectrum[0].freq : 0.01;
-      peakFreq += 0.5 * df * (L - R) / d;
+      const df = spec[1].freq - spec[0].freq;
+      pFreq += 0.5 * df * (L - R) / d;
     }
   }
+  let fftBPM = pFreq * 60;
 
-  let fftBPM = peakFreq * 60;
+  // 4. Peak-based BPM
+  const peaks  = detectPeaks(norm, fps);
+  lastPeakIdx  = peaks;
+  peakCount    = peaks.length;
+  let peakBPM  = 0;
+  let rrList   = [];
 
-  // 4. R-peak detection → inter-beat intervals
-  const peaks = detectRPeaks(norm, fps);
-  lastPeaks = peaks; // store for waveform drawing
-  let peakBPM = 0;
-  let rrList  = [];
-
-  if (peaks.length >= 3) {
+  if (peaks.length >= 4) {
     for (let i = 1; i < peaks.length; i++) {
       const rr = (peaks[i] - peaks[i-1]) / fps * 1000;
       if (rr > 280 && rr < 1500) rrList.push(rr);
     }
-    if (rrList.length >= 2) {
-      const avgRR = rrList.reduce((a,b)=>a+b,0) / rrList.length;
-      peakBPM = 60000 / avgRR;
+    if (rrList.length >= 3) {
+      peakBPM = 60000 / (rrList.reduce((a,b)=>a+b,0) / rrList.length);
     }
   }
-  peakCount = peaks.length;
 
-  // HRV (SDNN) from RR intervals
-  if (rrList.length >= 3) {
-    const mu  = rrList.reduce((a,b)=>a+b,0) / rrList.length;
-    const sdnn = Math.sqrt(rrList.reduce((a,b)=>a+(b-mu)**2,0) / rrList.length);
-    hrv = hrv === 0 ? sdnn : hrv * 0.75 + sdnn * 0.25;
+  // HRV
+  if (rrList.length >= 4) {
+    const mu2  = rrList.reduce((a,b)=>a+b,0) / rrList.length;
+    const sdnn = Math.sqrt(rrList.reduce((a,b)=>a+(b-mu2)**2,0) / rrList.length);
+    hrv = hrv === 0 ? sdnn : hrv * 0.8 + sdnn * 0.2;
   }
 
-  // 5. Harmonic correction
+  // 5. Harmonic fix
   fftBPM = fixHarmonic(fftBPM, peakBPM);
 
-  // 6. Cross-validate FFT vs peaks → final BPM + confidence
-  let rawBPM = fftBPM;
-  let conf   = sqi * 50; // base confidence from signal quality
-
+  // 6. Blend + confidence
+  let rawBPM = fftBPM, conf = sqi * 45;
   if (peakBPM > MIN_BPM && peakBPM < MAX_BPM) {
     const diff = Math.abs(fftBPM - peakBPM);
-    if (diff < 8) {
-      // Strong agreement — blend, high confidence
-      rawBPM = fftBPM * 0.5 + peakBPM * 0.5;
-      conf   = Math.min(92, sqi * 60 + 35);
-    } else if (diff < 18) {
-      // Moderate agreement — trust peak method more (direct timing)
-      rawBPM = fftBPM * 0.25 + peakBPM * 0.75;
-      conf   = Math.min(72, sqi * 50 + 20);
-    } else {
-      // Disagreement — use peaks (more direct), lower confidence
-      rawBPM = peakBPM;
-      conf   = Math.min(45, sqi * 35);
-    }
+    if (diff < 8)       { rawBPM = fftBPM * 0.45 + peakBPM * 0.55; conf = Math.min(90, sqi*55+35); }
+    else if (diff < 20) { rawBPM = fftBPM * 0.2  + peakBPM * 0.8;  conf = Math.min(68, sqi*45+18); }
+    else                { rawBPM = peakBPM;                          conf = Math.min(40, sqi*30); }
   }
 
   if (rawBPM < MIN_BPM || rawBPM > MAX_BPM) return;
 
-  // 7. Smooth BPM (only if not in motion)
-  if (!motionFlag) {
-    const smoothed = smoothBPM(rawBPM);
-    bpmSmooth  = smoothed;
-    confidence = Math.round(conf);
+  // 7. Outlier gate: only accept if within ±20 BPM of running average
+  //    This is the main fix for wild fluctuation
+  if (bpmDisplay > 0 && Math.abs(rawBPM - bpmDisplay) > 20) {
+    // Outlier — still push to history but don't update display yet
+    bpmHistory.push(rawBPM);
+    if (bpmHistory.length > BPM_HIST) bpmHistory.shift();
+    // If last 3 estimates all agree on new value, accept it (genuine HR change)
+    if (bpmHistory.length >= 3) {
+      const last3 = bpmHistory.slice(-3);
+      const l3mean = last3.reduce((a,b)=>a+b,0)/3;
+      if (last3.every(v => Math.abs(v - l3mean) < 12)) {
+        bpmDisplay = trimmedMean(bpmHistory);
+        confidence = Math.round(conf);
+      }
+    }
+    return;
   }
 
-  // Debug output
+  // 8. Trimmed mean smoothing
+  if (!motionFlag) {
+    bpmHistory.push(rawBPM);
+    if (bpmHistory.length > BPM_HIST) bpmHistory.shift();
+    if (bpmHistory.length >= 4) {
+      bpmDisplay = trimmedMean(bpmHistory);
+      confidence = Math.round(conf);
+    }
+  }
+
   document.getElementById('dbg').textContent =
-    `FFT:${Math.round(fftBPM)} PKS:${Math.round(peakBPM)}\nFPS:${fps.toFixed(1)} N:${useN}`;
+    `FFT:${Math.round(fftBPM)} PK:${Math.round(peakBPM)} SQI:${Math.round(sqi*100)}%\nFPS:${fps.toFixed(1)} N:${useN}`;
 }
 
 // ─────────────────────────────────────────────────────────
-//  ROI EXTRACTION + CANVAS DRAW
+//  ROI EXTRACTION — offscreen canvas, no size reset per frame
 // ─────────────────────────────────────────────────────────
+let roiDims = null; // computed once
+
 function extractROI(ts) {
   const W = video.videoWidth  || 640;
   const H = video.videoHeight || 480;
-  oc.width  = W;
-  oc.height = H;
 
-  // Mirror frame onto overlay canvas
-  octx.save();
-  octx.scale(-1, 1);
-  octx.drawImage(video, -W, 0, W, H);
-  octx.restore();
+  // Set offscreen canvas once (or if resolution changes)
+  if (offscreen.width !== W || offscreen.height !== H) {
+    offscreen.width  = W;
+    offscreen.height = H;
+  }
 
-  // Forehead ROI: center horizontal band, upper portion of face
-  // User should position face so forehead sits here
+  // Draw mirrored frame to offscreen (clean — no overlays)
+  offCtx.save();
+  offCtx.scale(-1, 1);
+  offCtx.drawImage(video, -W, 0, W, H);
+  offCtx.restore();
+
+  // ROI: forehead band
   const rx = Math.floor(W * 0.28);
   const ry = Math.floor(H * 0.08);
   const rw = Math.floor(W * 0.44);
-  const rh = Math.floor(H * 0.12);
+  const rh = Math.floor(H * 0.13);
+  roiDims  = { rx, ry, rw, rh, W, H };
 
-  let roiData;
   try {
-    const img = octx.getImageData(rx, ry, rw, rh);
-    roiData   = img.data;
-
-    // Motion detection on raw green pixel data
-    motionFlag = checkMotion(new Uint8Array(roiData));
-
-    // Spatial average of green channel only
+    const data = offCtx.getImageData(rx, ry, rw, rh).data;
     let gSum = 0, px = 0;
-    for (let i = 0; i < roiData.length; i += 4) {
-      gSum += roiData[i + 1]; // G
-      px++;
-    }
-    if (px > 0 && !motionFlag) {
-      gBuf.push(gSum / px / 255);
+    for (let i = 0; i < data.length; i += 4) { gSum += data[i+1]; px++; }
+    const gMean = px > 0 ? gSum / px / 255 : 0;
+
+    // Motion check on green mean rolling diff
+    motionFlag = checkMotion(gMean);
+
+    if (!motionFlag && px > 0) {
+      gBuf.push(gMean);
       tBuf.push(ts);
       if (gBuf.length > MAX_BUF) { gBuf.shift(); tBuf.shift(); }
     }
   } catch(e) {}
 
-  // Draw ROI box
+  // Draw overlay on oc (separate from sampling)
+  if (oc.width !== W || oc.height !== H) { oc.width = W; oc.height = H; }
+  octx.clearRect(0, 0, W, H);
+
+  // Draw current frame (mirrored) as background for overlay canvas
+  octx.save(); octx.scale(-1,1); octx.drawImage(video,-W,0,W,H); octx.restore();
+
+  // ROI box
   const t   = Date.now();
   const p   = 0.5 + 0.5 * Math.sin(t / 320);
-  const clr = motionFlag   ? `rgba(255,80,0,${.6+p*.4})`
-            : sqi > 0.5    ? `rgba(0,255,136,${.55+p*.45})`
-            :                `rgba(255,170,0,${.5+p*.4})`;
-
-  octx.shadowColor = motionFlag ? '#ff5000' : sqi > 0.5 ? '#00ff88' : '#ffaa00';
-  octx.shadowBlur  = 6 + p * 10;
+  const clr = motionFlag ? `rgba(255,100,0,${.6+p*.4})`
+            : sqi > 0.5  ? `rgba(0,255,136,${.55+p*.4})`
+            :               `rgba(255,170,0,${.5+p*.4})`;
+  octx.shadowColor = motionFlag?'#ff6400':sqi>0.5?'#00ff88':'#ffaa00';
+  octx.shadowBlur  = 5 + p*8;
   octx.strokeStyle = clr;
   octx.lineWidth   = 1.5;
   octx.strokeRect(rx, ry, rw, rh);
-
-  // Corner ticks
-  const cl = 12;
+  const cl = 11;
   octx.lineWidth = 2.5;
   [[rx,ry,1,1],[rx+rw,ry,-1,1],[rx,ry+rh,1,-1],[rx+rw,ry+rh,-1,-1]].forEach(([cx,cy,dx,dy])=>{
-    octx.beginPath();
-    octx.moveTo(cx,cy); octx.lineTo(cx+dx*cl,cy);
-    octx.moveTo(cx,cy); octx.lineTo(cx,cy+dy*cl);
-    octx.stroke();
+    octx.beginPath(); octx.moveTo(cx,cy); octx.lineTo(cx+dx*cl,cy);
+    octx.moveTo(cx,cy); octx.lineTo(cx,cy+dy*cl); octx.stroke();
   });
-
-  // Label
   octx.shadowBlur = 0;
   octx.fillStyle  = clr;
   octx.font       = '11px Share Tech Mono';
-  octx.fillText('FOREHEAD ROI', rx + 4, ry - 7);
+  octx.fillText('FOREHEAD ROI', rx+4, ry-7);
 
-  // Motion warning overlay
   document.getElementById('motionWarn').classList.toggle('show', motionFlag);
 }
 
@@ -548,7 +537,7 @@ function extractROI(ts) {
 //  WAVEFORM RENDERER
 // ─────────────────────────────────────────────────────────
 function drawWave() {
-  const W = wc.offsetWidth  || 500;
+  const W = wc.offsetWidth || 500;
   const H = 100;
   wc.width  = W;
   wc.height = H;
@@ -557,76 +546,55 @@ function drawWave() {
   wctx.fillRect(0, 0, W, H);
 
   // Grid
-  wctx.strokeStyle = '#161616';
-  wctx.lineWidth   = 1;
-  for (let x = 0; x < W; x += 60) { wctx.beginPath(); wctx.moveTo(x,0); wctx.lineTo(x,H); wctx.stroke(); }
+  wctx.strokeStyle = '#161616'; wctx.lineWidth = 1;
+  for (let x=0; x<W; x+=60) { wctx.beginPath(); wctx.moveTo(x,0); wctx.lineTo(x,H); wctx.stroke(); }
   wctx.beginPath(); wctx.moveTo(0,H/2); wctx.lineTo(W,H/2); wctx.stroke();
 
   const N = gBuf.length;
   if (N < 20) {
-    wctx.fillStyle = '#2a2a2a';
-    wctx.font = '11px Share Tech Mono';
-    wctx.textAlign = 'center';
-    wctx.fillText('WAITING FOR SIGNAL…', W/2, H/2 + 4);
-    return;
+    wctx.fillStyle='#2a2a2a'; wctx.font='11px Share Tech Mono'; wctx.textAlign='center';
+    wctx.fillText('WAITING FOR SIGNAL…', W/2, H/2+4); return;
   }
 
-  // Compute display signal
-  const fps = N > 2 ? (N-1) / ((tBuf[N-1]-tBuf[0])/1000) : 30;
-  const show = Math.min(N, Math.round(fps * 8)); // last 8s
+  const fps  = (N-1)/((tBuf[N-1]-tBuf[0])/1000);
+  const show = Math.min(N, Math.round(fps * 8));
   const raw  = gBuf.slice(-show);
-  const det  = detrend(raw, Math.round(fps * 2));
+  const det  = detrend(raw, fps);
   const mu   = det.reduce((a,b)=>a+b,0)/det.length;
   const sd   = Math.sqrt(det.reduce((a,b)=>a+(b-mu)**2,0)/det.length) || 1;
-  const norm = det.map(v => (v-mu)/sd);
+  const norm = det.map(v=>(v-mu)/sd);
 
-  // Map samples to canvas x-positions
-  const step  = norm.length / W;
-  const yOf   = v => H/2 - (v / 4) * H * 0.85;
+  const step = norm.length / W;
+  const yOf  = v => H/2 - (v/3.5)*H*0.85;
 
-  // Draw signal line
   wctx.beginPath();
-  for (let px = 0; px < W; px++) {
-    const idx = Math.min(norm.length-1, Math.floor(px * step));
-    px === 0 ? wctx.moveTo(px, yOf(norm[idx])) : wctx.lineTo(px, yOf(norm[idx]));
+  for (let px=0; px<W; px++) {
+    const idx = Math.min(norm.length-1, Math.floor(px*step));
+    px===0 ? wctx.moveTo(px, yOf(norm[idx])) : wctx.lineTo(px, yOf(norm[idx]));
   }
-  const grad = wctx.createLinearGradient(0, 0, W, 0);
-  const goodSig = sqi > 0.4;
-  if (goodSig) {
-    grad.addColorStop(0, 'rgba(0,255,136,0)');
-    grad.addColorStop(.1, '#00ff88');
-    grad.addColorStop(1,  '#00ffaa');
-    wctx.shadowColor = '#00ff88';
-  } else {
-    grad.addColorStop(0, 'rgba(255,170,0,0)');
-    grad.addColorStop(.1, '#ffaa00');
-    grad.addColorStop(1,  '#ffaa00');
-    wctx.shadowColor = '#ffaa00';
-  }
-  wctx.strokeStyle = grad;
-  wctx.lineWidth   = 1.8;
-  wctx.shadowBlur  = 4;
-  wctx.stroke();
-  wctx.shadowBlur  = 0;
+  const good = sqi > 0.4;
+  const grad = wctx.createLinearGradient(0,0,W,0);
+  grad.addColorStop(0, good?'rgba(0,255,136,0)':'rgba(255,170,0,0)');
+  grad.addColorStop(.08, good?'#00ff88':'#ffaa00');
+  grad.addColorStop(1,   good?'#00ffcc':'#ffcc44');
+  wctx.strokeStyle=grad; wctx.lineWidth=1.8;
+  wctx.shadowColor=good?'#00ff88':'#ffaa00'; wctx.shadowBlur=4;
+  wctx.stroke(); wctx.shadowBlur=0;
 
-  // Mark R-peaks
-  // lastPeaks indices are relative to norm (last useN samples),
-  // but norm here is last 'show' samples — map accordingly
-  const offset = Math.max(0, N - show);
-  const normOffset = Math.max(0, N - Math.min(N, Math.round(fps*10))) - offset;
-
-  lastPeaks.forEach(pi => {
-    const adjPi = pi + normOffset;
-    if (adjPi < 0 || adjPi >= norm.length) return;
-    const px = Math.round(adjPi / step);
-    const py = yOf(norm[adjPi]);
-    wctx.beginPath();
-    wctx.arc(px, py, 3.5, 0, Math.PI * 2);
-    wctx.fillStyle   = '#ff3355';
-    wctx.shadowColor = '#ff3355';
-    wctx.shadowBlur  = 7;
-    wctx.fill();
-    wctx.shadowBlur  = 0;
+  // R-peak markers
+  // lastPeakIdx is relative to last 15s window; map to last 8s (show) window
+  const processN = Math.min(N, Math.round(fps*15));
+  const showStart= N - show;
+  const procStart= N - processN;
+  lastPeakIdx.forEach(pi => {
+    const globalI = procStart + pi;
+    const showI   = globalI - showStart;
+    if (showI < 0 || showI >= show) return;
+    const px = Math.round(showI / step);
+    const py = yOf(norm[showI]);
+    wctx.beginPath(); wctx.arc(px,py,3.5,0,Math.PI*2);
+    wctx.fillStyle='#ff3355'; wctx.shadowColor='#ff3355'; wctx.shadowBlur=7;
+    wctx.fill(); wctx.shadowBlur=0;
   });
 }
 
@@ -634,15 +602,11 @@ function drawWave() {
 //  UI UPDATE
 // ─────────────────────────────────────────────────────────
 function updateUI() {
-  const bpm = bpmSmooth;
-  const bpmR = bpm > 0 ? Math.round(bpm) : null;
-
-  // BPM value
-  const bv = document.getElementById('bpmVal');
+  const bpmR = bpmDisplay > 0 ? Math.round(bpmDisplay) : null;
+  const bv   = document.getElementById('bpmVal');
   bv.textContent = bpmR ?? '--';
-  bv.className   = 'bpm-val' + (bpmR ? (bpmR<60?' low':bpmR>100?' high':' normal') : '');
+  bv.className   = 'bpm-val'+(bpmR?(bpmR<60?' low':bpmR>100?' high':' normal'):'');
 
-  // Status
   const bs = document.getElementById('bpmStat');
   if (!calDone)        bs.textContent = '';
   else if (!bpmR)      bs.textContent = 'ACQUIRING SIGNAL…';
@@ -650,52 +614,36 @@ function updateUI() {
   else if (bpmR > 100) bs.textContent = 'TACHYCARDIA RANGE';
   else                 bs.textContent = 'NORMAL RANGE';
 
-  // Meta cards
-  document.getElementById('hrvVal').textContent  = hrv > 0      ? Math.round(hrv)  : '--';
-  document.getElementById('confVal').textContent = bpm > 0      ? confidence        : '--';
-  document.getElementById('peakVal').textContent = peakCount > 0 ? peakCount        : '--';
+  document.getElementById('hrvVal').textContent  = hrv>0 ? Math.round(hrv) : '--';
+  document.getElementById('confVal').textContent = bpmDisplay>0 ? confidence : '--';
+  document.getElementById('peakVal').textContent = peakCount>0  ? peakCount  : '--';
 
-  // SQI label
   const sqiEl = document.getElementById('sqiLabel');
-  const sqiPct = Math.round(sqi * 100);
-  sqiEl.textContent = `SQI: ${sqiPct}%`;
-  sqiEl.style.color  = sqi > 0.6 ? 'var(--green)' : sqi > 0.3 ? 'var(--amber)' : 'var(--red)';
+  sqiEl.textContent = `SQI: ${Math.round(sqi*100)}%`;
+  sqiEl.style.color = sqi>.6?'var(--green)':sqi>.3?'var(--amber)':'var(--red)';
   sqiEl.style.borderColor = sqiEl.style.color;
 
-  // SQI bars (10 segments)
-  const colors = ['#ff3355','#ff5533','#ff7733','#ffaa00','#ffcc00','#ccee00','#88ee44','#44dd88','#00ff88','#00ffaa'];
-  const q10 = Math.round(sqi * 10);
-  for (let i = 0; i < 10; i++) {
-    document.getElementById('s'+i).style.background = i < q10 ? colors[i] : 'var(--border)';
-  }
+  const colors=['#ff3355','#ff5533','#ff7733','#ff9900','#ffbb00','#ccee00','#88ee44','#44dd88','#00ff88','#00ffaa'];
+  const q10=Math.round(sqi*10);
+  for(let i=0;i<10;i++) document.getElementById('s'+i).style.background=i<q10?colors[i]:'var(--border)';
 
-  // Beat animation
-  if (bpm > 0) {
-    const interval = 60000 / bpm;
+  if (bpmDisplay > 0) {
+    const interval = 60000 / bpmDisplay;
     const now = performance.now();
     if (now - lastBeat > interval * 0.9) {
       lastBeat = now;
       const h = document.getElementById('heart');
-      h.style.setProperty('--beat-dur', (interval * 0.6 / 1000).toFixed(2) + 's');
-      h.classList.remove('beat');
-      void h.offsetWidth;
-      h.classList.add('beat');
+      h.style.setProperty('--beat-dur', (interval*.6/1000).toFixed(2)+'s');
+      h.classList.remove('beat'); void h.offsetWidth; h.classList.add('beat');
     }
   }
 
-  // Calibration bar
   if (!calDone && running) {
-    const N   = gBuf.length;
-    const fps = N > 2 ? (N-1)/((tBuf[N-1]-tBuf[0])/1000) : 30;
-    const pct = Math.min(100, (N / (fps * CAL_SECS)) * 100);
-    document.getElementById('calFill').style.width = pct + '%';
-    if (pct >= 100) {
-      calDone = true;
-      document.getElementById('cal').classList.add('gone');
-    } else {
-      document.getElementById('calMsg').textContent = 'CALIBRATING…';
-      document.getElementById('calSub').textContent = `Keep still · ${Math.round(pct/10)}s`;
-    }
+    const fps = gBuf.length>2 ? (gBuf.length-1)/((tBuf[tBuf.length-1]-tBuf[0])/1000) : 30;
+    const pct = Math.min(100, (gBuf.length/(fps*CAL_SECS))*100);
+    document.getElementById('calFill').style.width = pct+'%';
+    document.getElementById('calSub').textContent  = `Keep still · ${(10-Math.round(pct/10))}s remaining`;
+    if (pct >= 100) { calDone=true; document.getElementById('cal').classList.add('gone'); }
   }
 }
 
@@ -707,18 +655,14 @@ function loop(ts) {
   if (!running) return;
   raf = requestAnimationFrame(loop);
 
-  // FPS counter
   fpsCount++;
-  if (ts - fpsLast >= 1000) { fpsCur = fpsCount; fpsCount = 0; fpsLast = ts; }
+  if (ts - fpsLast >= 1000) { fpsCur=fpsCount; fpsCount=0; fpsLast=ts; }
 
-  // Every frame: capture ROI
   if (video.readyState >= 2) extractROI(ts);
 
   loopN++;
-  // Process every 12 frames (~2.5×/sec at 30fps)
-  if (loopN % 12 === 0) process();
-  // Update UI + waveform every 5 frames (~6×/sec)
-  if (loopN % 5 === 0)  { drawWave(); updateUI(); }
+  if (loopN % 30 === 0) process();         // process once/sec — stable estimate
+  if (loopN % 6  === 0) { drawWave(); updateUI(); }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -727,50 +671,48 @@ function loop(ts) {
 async function start() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { width:{ideal:640}, height:{ideal:480}, frameRate:{ideal:30}, facingMode:'user' },
-      audio: false
+      video:{ width:{ideal:640},height:{ideal:480},frameRate:{ideal:30},facingMode:'user' },
+      audio:false
     });
     video.srcObject = stream;
     await video.play();
-  } catch(e) { alert('Camera access failed:\n' + e.message); return; }
+  } catch(e) { alert('Camera access failed:\n'+e.message); return; }
 
-  // Reset
-  gBuf=[]; tBuf=[]; prevRoi=null;
-  bpmSmooth=0; bpmHistory=[]; hrv=0; sqi=0; confidence=0; peakCount=0;
-  motionFlag=false; lastPeaks=[]; calDone=false; loopN=0; fpsCount=0; fpsLast=0;
+  gBuf=[]; tBuf=[]; motionHistory=[]; prevGreenMean=null;
+  bpmDisplay=0; bpmHistory=[]; hrv=0; sqi=0; confidence=0; peakCount=0;
+  motionFlag=false; lastPeakIdx=[]; calDone=false; loopN=0; fpsCount=0; fpsLast=0; lastBeat=0;
 
   document.getElementById('cal').classList.remove('gone');
-  document.getElementById('calMsg').textContent = 'CALIBRATING…';
-  document.getElementById('calSub').textContent = 'Keep forehead in box · stay still';
-  document.getElementById('calFill').style.width = '0%';
-  document.getElementById('startBtn').disabled = true;
-  document.getElementById('stopBtn').disabled  = false;
+  document.getElementById('calMsg').textContent='CALIBRATING…';
+  document.getElementById('calSub').textContent='Keep forehead in box · stay still';
+  document.getElementById('calFill').style.width='0%';
+  document.getElementById('startBtn').disabled=true;
+  document.getElementById('stopBtn').disabled=false;
   document.getElementById('heart').classList.remove('beat');
 
-  running = true;
-  raf = requestAnimationFrame(loop);
+  running=true;
+  raf=requestAnimationFrame(loop);
 }
 
 function stop() {
-  running = false;
+  running=false;
   if (raf) cancelAnimationFrame(raf);
-  if (stream) stream.getTracks().forEach(t => t.stop());
-  video.srcObject = null;
+  if (stream) stream.getTracks().forEach(t=>t.stop());
+  video.srcObject=null;
 
-  gBuf=[]; tBuf=[]; bpmSmooth=0; bpmHistory=[]; hrv=0; sqi=0; confidence=0; peakCount=0;
-  motionFlag=false; lastPeaks=[];
+  gBuf=[]; tBuf=[]; bpmDisplay=0; bpmHistory=[]; hrv=0; sqi=0; confidence=0; peakCount=0;
+  motionFlag=false; lastPeakIdx=[]; prevGreenMean=null; motionHistory=[];
 
   document.getElementById('cal').classList.remove('gone');
-  document.getElementById('calMsg').textContent = 'STOPPED';
-  document.getElementById('calSub').textContent  = 'Click START to begin';
-  document.getElementById('calFill').style.width = '0%';
-  document.getElementById('startBtn').disabled = false;
-  document.getElementById('stopBtn').disabled  = true;
+  document.getElementById('calMsg').textContent='STOPPED';
+  document.getElementById('calSub').textContent='Click START to begin';
+  document.getElementById('calFill').style.width='0%';
+  document.getElementById('startBtn').disabled=false;
+  document.getElementById('stopBtn').disabled=true;
   document.getElementById('heart').classList.remove('beat');
-  document.getElementById('bpmStat').textContent = '';
+  document.getElementById('bpmStat').textContent='';
 
-  updateUI();
-  drawWave();
+  updateUI(); drawWave();
 }
 
 drawWave();
