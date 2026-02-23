@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rPPG Heart Rate Monitor</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;700;900&display=swap');
+
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#080808;--panel:#101010;--border:#1c1c1c;
+  --green:#00ff88;--red:#ff3355;--amber:#ffaa00;--blue:#00cfff;
+  --dim:#3a3a3a;--text:#ccc;
+}
+body{background:var(--bg);color:var(--text);font-family:'Barlow',sans-serif;
+  min-height:100vh;display:flex;flex-direction:column;align-items:center;
+  justify-content:center;padding:20px;gap:16px}
+
+h1{font-family:'Share Tech Mono',monospace;font-size:.65rem;letter-spacing:5px;
+   color:var(--dim);text-transform:uppercase;text-align:center}
+
+.layout{display:grid;grid-template-columns:360px 1fr;gap:14px;width:100%;max-width:980px}
+
+/* ── Camera ── */
+.cam-panel{background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;position:relative}
+.video-wrap{position:relative;width:100%;aspect-ratio:4/3;background:#000;overflow:hidden}
+video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);display:block}
+#overlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.cam-footer{padding:10px 14px;display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.sq-wrap{display:flex;align-items:center;gap:3px}
+.sq-lbl{font-family:'Share Tech Mono',monospace;font-size:.58rem;letter-spacing:2px;color:var(--dim);margin-right:4px}
+.sq-bar{width:5px;height:12px;border-radius:2px;background:var(--border);transition:background .3s}
+.debug{font-family:'Share Tech Mono',monospace;font-size:.55rem;color:var(--dim);line-height:1.7;text-align:right}
+
+/* ── Right ── */
+.right{display:flex;flex-direction:column;gap:12px}
+
+/* BPM card */
+.bpm-card{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+  padding:22px 26px;display:flex;align-items:center;gap:20px;position:relative;overflow:hidden}
+.bpm-glow{position:absolute;inset:0;background:radial-gradient(ellipse at 0% 50%,rgba(255,51,85,.07),transparent 70%);pointer-events:none}
+.heart{font-size:2rem;flex-shrink:0;display:inline-block;transition:transform .1s}
+.heart.beat{animation:hb var(--beat-dur,.8s) ease-out}
+@keyframes hb{0%,100%{transform:scale(1)}20%{transform:scale(1.3)}40%{transform:scale(1.05)}60%{transform:scale(1.2)}80%{transform:scale(1)}}
+.bpm-body{flex:1}
+.bpm-lbl{font-family:'Share Tech Mono',monospace;font-size:.6rem;letter-spacing:4px;color:var(--dim);margin-bottom:2px}
+.bpm-val{font-size:5rem;font-weight:900;line-height:1;letter-spacing:-2px;color:var(--red);
+  font-variant-numeric:tabular-nums;transition:color .4s}
+.bpm-val.normal{color:var(--red)}.bpm-val.low{color:var(--amber)}.bpm-val.high{color:#ff44cc}
+.bpm-unit{font-family:'Share Tech Mono',monospace;font-size:.7rem;letter-spacing:3px;color:var(--dim);margin-top:2px}
+.bpm-status{font-family:'Share Tech Mono',monospace;font-size:.62rem;letter-spacing:2px;color:var(--dim);margin-top:6px;min-height:16px}
+
+/* Waveform */
+.wave-card{background:var(--panel);border:1px solid var(--border);border-radius:14px;
+  padding:14px 18px;display:flex;flex-direction:column;gap:8px}
+.wave-hdr{display:flex;justify-content:space-between;align-items:center}
+.wave-lbl{font-family:'Share Tech Mono',monospace;font-size:.58rem;letter-spacing:3px;color:var(--dim)}
+.wave-sqi{font-family:'Share Tech Mono',monospace;font-size:.6rem;letter-spacing:2px;padding:2px 8px;
+  border-radius:4px;border:1px solid var(--border);background:#0a0a0a;color:var(--dim);transition:all .3s}
+#waveCanvas{width:100%;height:100px;display:block;border-radius:6px}
+
+/* Meta row */
+.meta-row{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.meta-card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:12px 14px}
+.meta-lbl{font-family:'Share Tech Mono',monospace;font-size:.55rem;letter-spacing:2px;color:var(--dim);margin-bottom:3px}
+.meta-val{font-size:1.6rem;font-weight:700;font-variant-numeric:tabular-nums;color:var(--green)}
+.meta-unit{font-family:'Share Tech Mono',monospace;font-size:.55rem;letter-spacing:2px;color:var(--dim)}
+
+/* Buttons */
+.btn-row{display:flex;gap:10px}
+.btn{flex:1;padding:10px;border-radius:8px;border:none;font-family:'Share Tech Mono',monospace;
+  font-size:.72rem;letter-spacing:2px;cursor:pointer;text-transform:uppercase;transition:all .15s}
+.btn-start{background:var(--green);color:#000}.btn-start:hover{filter:brightness(1.1)}
+.btn-start:disabled{opacity:.4;cursor:default}
+.btn-stop{background:#161616;color:var(--dim);border:1px solid #222}
+.btn-stop:hover:not(:disabled){border-color:var(--red);color:var(--red)}
+.btn-stop:disabled{opacity:.3;cursor:default}
+
+/* Calibration overlay */
+.cal{position:absolute;inset:0;background:rgba(8,8,8,.93);display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:12px;z-index:9;border-radius:14px}
+.cal.gone{display:none}
+.cal-ring{width:48px;height:48px;border:3px solid #1c1c1c;border-top-color:var(--green);
+  border-radius:50%;animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.cal-msg{font-family:'Share Tech Mono',monospace;font-size:.68rem;letter-spacing:3px;color:var(--green);text-align:center}
+.cal-sub{font-family:'Share Tech Mono',monospace;font-size:.55rem;letter-spacing:2px;color:var(--dim);text-align:center}
+.cal-prog{width:150px;height:3px;background:#1c1c1c;border-radius:2px;overflow:hidden}
+.cal-fill{height:100%;background:var(--green);border-radius:2px;transition:width .2s;width:0%}
+
+/* Motion warning */
+.motion-warn{position:absolute;top:8px;left:8px;font-family:'Share Tech Mono',monospace;
+  font-size:.6rem;letter-spacing:2px;color:var(--amber);background:rgba(0,0,0,.8);
+  padding:3px 8px;border-radius:4px;border:1px solid rgba(255,170,0,.3);
+  display:none;z-index:8}
+.motion-warn.show{display:block}
+
+.tip{font-family:'Share Tech Mono',monospace;font-size:.55rem;letter-spacing:2px;
+  color:var(--dim);text-align:center;line-height:2}
+
+@media(max-width:700px){.layout{grid-template-columns:1fr}.meta-row{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+
+<h1>rPPG · Forehead Blood Flow · Green Absorption · R-Peak BPM</h1>
+
+<div class="layout">
+
+  <!-- Left: Camera -->
+  <div class="cam-panel">
+    <div class="video-wrap">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
+      <div class="motion-warn" id="motionWarn">⚠ MOTION — HOLD STILL</div>
+      <div class="cal" id="cal">
+        <div class="cal-ring"></div>
+        <div class="cal-msg" id="calMsg">AWAITING CAMERA</div>
+        <div class="cal-sub" id="calSub">Click START to begin</div>
+        <div class="cal-prog"><div class="cal-fill" id="calFill"></div></div>
+      </div>
+    </div>
+    <div class="cam-footer">
+      <div class="sq-wrap">
+        <span class="sq-lbl">SQI</span>
+        <div class="sq-bar" id="s0"></div><div class="sq-bar" id="s1"></div>
+        <div class="sq-bar" id="s2"></div><div class="sq-bar" id="s3"></div>
+        <div class="sq-bar" id="s4"></div><div class="sq-bar" id="s5"></div>
+        <div class="sq-bar" id="s6"></div><div class="sq-bar" id="s7"></div>
+        <div class="sq-bar" id="s8"></div><div class="sq-bar" id="s9"></div>
+      </div>
+      <div class="debug" id="dbg">--</div>
+    </div>
+  </div>
+
+  <!-- Right -->
+  <div class="right">
+
+    <div class="bpm-card">
+      <div class="bpm-glow"></div>
+      <span class="heart" id="heart">🫀</span>
+      <div class="bpm-body">
+        <div class="bpm-lbl">HEART RATE</div>
+        <div class="bpm-val" id="bpmVal">--</div>
+        <div class="bpm-unit">BPM</div>
+        <div class="bpm-status" id="bpmStat"></div>
+      </div>
+    </div>
+
+    <div class="wave-card">
+      <div class="wave-hdr">
+        <span class="wave-lbl">GREEN CHANNEL · DETRENDED · R-PEAKS MARKED</span>
+        <span class="wave-sqi" id="sqiLabel">SQI: --</span>
+      </div>
+      <canvas id="waveCanvas"></canvas>
+    </div>
+
+    <div class="meta-row">
+      <div class="meta-card">
+        <div class="meta-lbl">HRV · SDNN</div>
+        <div class="meta-val" id="hrvVal">--</div>
+        <div class="meta-unit">MS</div>
+      </div>
+      <div class="meta-card">
+        <div class="meta-lbl">CONFIDENCE</div>
+        <div class="meta-val" id="confVal">--</div>
+        <div class="meta-unit">%</div>
+      </div>
+      <div class="meta-card">
+        <div class="meta-lbl">R-PEAKS</div>
+        <div class="meta-val" id="peakVal">--</div>
+        <div class="meta-unit">DETECTED</div>
+      </div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-start" id="startBtn" onclick="start()">▶ START</button>
+      <button class="btn btn-stop"  id="stopBtn"  onclick="stop()" disabled>■ STOP</button>
+    </div>
+
+  </div>
+</div>
+
+<div class="tip">
+  CENTER FOREHEAD IN BOX · FRONT LIGHT · STAY STILL · WAIT 10s CALIBRATION
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════
+//  rPPG ENGINE
+//  Pipeline:
+//    1. ROI extraction → spatial avg of green channel (forehead only)
+//    2. Detrend (sliding-window mean subtraction, 2s window)
+//    3. Normalize (zero-mean, unit variance)
+//    4. Hann-windowed DFT → dominant frequency → raw BPM
+//    5. Harmonic correction (sub-harmonic lock fix)
+//    6. Adaptive R-peak detection → inter-beat intervals → peak BPM
+//    7. Motion detection (frame-diff on ROI) → freeze BPM if moving
+//    8. SQI = peak prominence ratio (dominant / mean spectrum)
+//    9. BPM smoothing: trimmed moving average of last 7 values
+//   10. Cross-validate FFT vs peak BPM → final estimate + confidence
+// ═══════════════════════════════════════════════════════════════════
+
+const MIN_BPM   = 45;
+const MAX_BPM   = 180;
+const CAL_SECS  = 10;       // calibration period
+const MAX_BUF   = 900;      // ~30s at 30fps
+const BPM_HIST  = 7;        // smoothing window
+const MOTION_TH = 0.004;    // motion detection threshold (mean abs diff)
+
+let running = false, calDone = false;
+let stream = null, raf = null;
+
+// Buffers
+let gBuf  = [];   // green channel mean per frame [0–1]
+let tBuf  = [];   // timestamps ms
+let prevRoi = null; // for motion detection
+
+// Outputs
+let bpmSmooth  = 0;
+let bpmHistory = [];   // last N raw estimates for smoothing
+let hrv        = 0;
+let sqi        = 0;    // 0–1
+let confidence = 0;    // 0–100
+let peakCount  = 0;
+let motionFlag = false;
+let lastPeaks  = [];   // indices of last detected R-peaks (for waveform)
+
+// FPS
+let fpsCount = 0, fpsLast = 0, fpsCur = 0;
+
+// Beat animation
+let lastBeat = 0;
+
+// DOM
+const video   = document.getElementById('video');
+const oc      = document.getElementById('overlay');
+const octx    = oc.getContext('2d', { willReadFrequently: true });
+const wc      = document.getElementById('waveCanvas');
+const wctx    = wc.getContext('2d');
+
+// ─────────────────────────────────────────────────────────
+//  DSP HELPERS
+// ─────────────────────────────────────────────────────────
+
+// Sliding-window detrend: removes slow DC drift
+function detrend(sig, winSamples) {
+  const half = Math.floor(winSamples / 2);
+  return sig.map((v, i) => {
+    let s = 0, c = 0;
+    const lo = Math.max(0, i - half), hi = Math.min(sig.length - 1, i + half);
+    for (let j = lo; j <= hi; j++) { s += sig[j]; c++; }
+    return v - s / c;
+  });
+}
+
+// Hann window
+function hann(sig) {
+  const N = sig.length;
+  return sig.map((v, i) => v * 0.5 * (1 - Math.cos(2 * Math.PI * i / (N - 1))));
+}
+
+// DFT magnitude — computed only in BPM frequency range
+// Returns array of {freq, mag}
+function dft(sig, fps) {
+  const N    = sig.length;
+  const kLo  = Math.max(1, Math.floor(MIN_BPM / 60 * N / fps));
+  const kHi  = Math.min(Math.floor(N / 2), Math.ceil(MAX_BPM / 60 * N / fps));
+  const out  = [];
+  for (let k = kLo; k <= kHi; k++) {
+    let re = 0, im = 0;
+    const w = 2 * Math.PI * k / N;
+    for (let n = 0; n < N; n++) { re += sig[n] * Math.cos(w * n); im -= sig[n] * Math.sin(w * n); }
+    out.push({ freq: k * fps / N, mag: Math.hypot(re, im) });
+  }
+  return out;
+}
+
+// Signal Quality Index: ratio of dominant peak to mean spectrum
+// SQI > 3 = clean; < 1.5 = noisy
+function computeSQI(spectrum) {
+  if (!spectrum.length) return 0;
+  const mags  = spectrum.map(s => s.mag);
+  const peak  = Math.max(...mags);
+  const mean  = mags.reduce((a,b)=>a+b,0) / mags.length;
+  return mean > 0 ? Math.min(1, (peak / mean - 1) / 9) : 0; // normalise 0–1
+}
+
+// Harmonic correction: if FFT locks onto f/2 sub-harmonic, double it
+function fixHarmonic(fftBPM, peakBPM) {
+  if (fftBPM < 65) {
+    const doubled = fftBPM * 2;
+    if (doubled >= MIN_BPM && doubled <= MAX_BPM) {
+      // Accept double if peakBPM agrees, or if no peak estimate available
+      if (peakBPM === 0 || Math.abs(doubled - peakBPM) < Math.abs(fftBPM - peakBPM)) {
+        return doubled;
+      }
+    }
+  }
+  return fftBPM;
+}
+
+// Adaptive R-peak detection on normalised signal
+// Uses local adaptive threshold + refractory period
+function detectRPeaks(norm, fps) {
+  // Adaptive threshold: 60th percentile of absolute values
+  const sorted = [...norm].sort((a,b) => a - b);
+  const thresh = sorted[Math.floor(sorted.length * 0.60)];
+  const refractory = Math.round(fps * 0.28); // 280ms
+
+  const peaks = [];
+  for (let i = 2; i < norm.length - 2; i++) {
+    if (norm[i] > thresh &&
+        norm[i] > norm[i-1] && norm[i] > norm[i+1] &&
+        norm[i] > norm[i-2] && norm[i] > norm[i+2]) {
+      if (!peaks.length || i - peaks[peaks.length-1] > refractory) {
+        peaks.push(i);
+      }
+    }
+  }
+  return peaks;
+}
+
+// Trimmed moving average BPM smoother
+// Drops highest and lowest values before averaging
+function smoothBPM(raw) {
+  bpmHistory.push(raw);
+  if (bpmHistory.length > BPM_HIST) bpmHistory.shift();
+  if (bpmHistory.length < 3) return raw;
+  const sorted = [...bpmHistory].sort((a,b)=>a-b);
+  // Trim 1 from each end
+  const trimmed = sorted.slice(1, sorted.length - 1);
+  return trimmed.reduce((a,b)=>a+b,0) / trimmed.length;
+}
+
+// ─────────────────────────────────────────────────────────
+//  MOTION DETECTION
+// ─────────────────────────────────────────────────────────
+function checkMotion(currentRoi) {
+  if (!prevRoi || prevRoi.length !== currentRoi.length) {
+    prevRoi = currentRoi;
+    return false;
+  }
+  let diff = 0;
+  const step = 4; // sample every 4th pixel for speed
+  let count = 0;
+  for (let i = 1; i < currentRoi.length; i += step * 4) {
+    diff += Math.abs(currentRoi[i] - prevRoi[i]) / 255;
+    count++;
+  }
+  prevRoi = currentRoi;
+  return count > 0 ? (diff / count) > MOTION_TH : false;
+}
+
+// ─────────────────────────────────────────────────────────
+//  MAIN SIGNAL PROCESSOR
+// ─────────────────────────────────────────────────────────
+function process() {
+  const N = gBuf.length;
+  if (N < 30) return;
+
+  // Real FPS from timestamps
+  const tSpan = tBuf[N-1] - tBuf[0];
+  const fps = (N - 1) / (tSpan / 1000);
+  if (fps < 5 || fps > 120) return;
+
+  // Use last 10 seconds of data
+  const useN = Math.min(N, Math.round(fps * 10));
+  const raw  = gBuf.slice(-useN);
+
+  // 1. Detrend (2-second window)
+  const det = detrend(raw, Math.round(fps * 2));
+
+  // 2. Normalize
+  const mu   = det.reduce((a,b)=>a+b,0) / det.length;
+  const sig2 = Math.sqrt(det.reduce((a,b)=>a+(b-mu)**2,0) / det.length);
+  if (sig2 < 0.00005) return; // signal too flat
+  const norm = det.map(v => (v - mu) / sig2);
+
+  // 3. FFT → dominant frequency
+  const windowed = hann(norm);
+  const spectrum = dft(windowed, fps);
+  if (!spectrum.length) return;
+
+  // SQI from spectrum
+  sqi = computeSQI(spectrum);
+
+  // Find peak bin
+  let bestIdx = 0;
+  for (let i = 1; i < spectrum.length; i++) {
+    if (spectrum[i].mag > spectrum[bestIdx].mag) bestIdx = i;
+  }
+
+  // Parabolic interpolation for sub-bin frequency accuracy
+  let peakFreq = spectrum[bestIdx].freq;
+  if (bestIdx > 0 && bestIdx < spectrum.length - 1) {
+    const L = spectrum[bestIdx-1].mag, C = spectrum[bestIdx].mag, R = spectrum[bestIdx+1].mag;
+    const d = L - 2*C + R;
+    if (d < 0) {
+      const df = spectrum.length > 1 ? spectrum[1].freq - spectrum[0].freq : 0.01;
+      peakFreq += 0.5 * df * (L - R) / d;
+    }
+  }
+
+  let fftBPM = peakFreq * 60;
+
+  // 4. R-peak detection → inter-beat intervals
+  const peaks = detectRPeaks(norm, fps);
+  lastPeaks = peaks; // store for waveform drawing
+  let peakBPM = 0;
+  let rrList  = [];
+
+  if (peaks.length >= 3) {
+    for (let i = 1; i < peaks.length; i++) {
+      const rr = (peaks[i] - peaks[i-1]) / fps * 1000;
+      if (rr > 280 && rr < 1500) rrList.push(rr);
+    }
+    if (rrList.length >= 2) {
+      const avgRR = rrList.reduce((a,b)=>a+b,0) / rrList.length;
+      peakBPM = 60000 / avgRR;
+    }
+  }
+  peakCount = peaks.length;
+
+  // HRV (SDNN) from RR intervals
+  if (rrList.length >= 3) {
+    const mu  = rrList.reduce((a,b)=>a+b,0) / rrList.length;
+    const sdnn = Math.sqrt(rrList.reduce((a,b)=>a+(b-mu)**2,0) / rrList.length);
+    hrv = hrv === 0 ? sdnn : hrv * 0.75 + sdnn * 0.25;
+  }
+
+  // 5. Harmonic correction
+  fftBPM = fixHarmonic(fftBPM, peakBPM);
+
+  // 6. Cross-validate FFT vs peaks → final BPM + confidence
+  let rawBPM = fftBPM;
+  let conf   = sqi * 50; // base confidence from signal quality
+
+  if (peakBPM > MIN_BPM && peakBPM < MAX_BPM) {
+    const diff = Math.abs(fftBPM - peakBPM);
+    if (diff < 8) {
+      // Strong agreement — blend, high confidence
+      rawBPM = fftBPM * 0.5 + peakBPM * 0.5;
+      conf   = Math.min(92, sqi * 60 + 35);
+    } else if (diff < 18) {
+      // Moderate agreement — trust peak method more (direct timing)
+      rawBPM = fftBPM * 0.25 + peakBPM * 0.75;
+      conf   = Math.min(72, sqi * 50 + 20);
+    } else {
+      // Disagreement — use peaks (more direct), lower confidence
+      rawBPM = peakBPM;
+      conf   = Math.min(45, sqi * 35);
+    }
+  }
+
+  if (rawBPM < MIN_BPM || rawBPM > MAX_BPM) return;
+
+  // 7. Smooth BPM (only if not in motion)
+  if (!motionFlag) {
+    const smoothed = smoothBPM(rawBPM);
+    bpmSmooth  = smoothed;
+    confidence = Math.round(conf);
+  }
+
+  // Debug output
+  document.getElementById('dbg').textContent =
+    `FFT:${Math.round(fftBPM)} PKS:${Math.round(peakBPM)}\nFPS:${fps.toFixed(1)} N:${useN}`;
+}
+
+// ─────────────────────────────────────────────────────────
+//  ROI EXTRACTION + CANVAS DRAW
+// ─────────────────────────────────────────────────────────
+function extractROI(ts) {
+  const W = video.videoWidth  || 640;
+  const H = video.videoHeight || 480;
+  oc.width  = W;
+  oc.height = H;
+
+  // Mirror frame onto overlay canvas
+  octx.save();
+  octx.scale(-1, 1);
+  octx.drawImage(video, -W, 0, W, H);
+  octx.restore();
+
+  // Forehead ROI: center horizontal band, upper portion of face
+  // User should position face so forehead sits here
+  const rx = Math.floor(W * 0.28);
+  const ry = Math.floor(H * 0.08);
+  const rw = Math.floor(W * 0.44);
+  const rh = Math.floor(H * 0.12);
+
+  let roiData;
+  try {
+    const img = octx.getImageData(rx, ry, rw, rh);
+    roiData   = img.data;
+
+    // Motion detection on raw green pixel data
+    motionFlag = checkMotion(new Uint8Array(roiData));
+
+    // Spatial average of green channel only
+    let gSum = 0, px = 0;
+    for (let i = 0; i < roiData.length; i += 4) {
+      gSum += roiData[i + 1]; // G
+      px++;
+    }
+    if (px > 0 && !motionFlag) {
+      gBuf.push(gSum / px / 255);
+      tBuf.push(ts);
+      if (gBuf.length > MAX_BUF) { gBuf.shift(); tBuf.shift(); }
+    }
+  } catch(e) {}
+
+  // Draw ROI box
+  const t   = Date.now();
+  const p   = 0.5 + 0.5 * Math.sin(t / 320);
+  const clr = motionFlag   ? `rgba(255,80,0,${.6+p*.4})`
+            : sqi > 0.5    ? `rgba(0,255,136,${.55+p*.45})`
+            :                `rgba(255,170,0,${.5+p*.4})`;
+
+  octx.shadowColor = motionFlag ? '#ff5000' : sqi > 0.5 ? '#00ff88' : '#ffaa00';
+  octx.shadowBlur  = 6 + p * 10;
+  octx.strokeStyle = clr;
+  octx.lineWidth   = 1.5;
+  octx.strokeRect(rx, ry, rw, rh);
+
+  // Corner ticks
+  const cl = 12;
+  octx.lineWidth = 2.5;
+  [[rx,ry,1,1],[rx+rw,ry,-1,1],[rx,ry+rh,1,-1],[rx+rw,ry+rh,-1,-1]].forEach(([cx,cy,dx,dy])=>{
+    octx.beginPath();
+    octx.moveTo(cx,cy); octx.lineTo(cx+dx*cl,cy);
+    octx.moveTo(cx,cy); octx.lineTo(cx,cy+dy*cl);
+    octx.stroke();
+  });
+
+  // Label
+  octx.shadowBlur = 0;
+  octx.fillStyle  = clr;
+  octx.font       = '11px Share Tech Mono';
+  octx.fillText('FOREHEAD ROI', rx + 4, ry - 7);
+
+  // Motion warning overlay
+  document.getElementById('motionWarn').classList.toggle('show', motionFlag);
+}
+
+// ─────────────────────────────────────────────────────────
+//  WAVEFORM RENDERER
+// ─────────────────────────────────────────────────────────
+function drawWave() {
+  const W = wc.offsetWidth  || 500;
+  const H = 100;
+  wc.width  = W;
+  wc.height = H;
+
+  wctx.fillStyle = '#0a0a0a';
+  wctx.fillRect(0, 0, W, H);
+
+  // Grid
+  wctx.strokeStyle = '#161616';
+  wctx.lineWidth   = 1;
+  for (let x = 0; x < W; x += 60) { wctx.beginPath(); wctx.moveTo(x,0); wctx.lineTo(x,H); wctx.stroke(); }
+  wctx.beginPath(); wctx.moveTo(0,H/2); wctx.lineTo(W,H/2); wctx.stroke();
+
+  const N = gBuf.length;
+  if (N < 20) {
+    wctx.fillStyle = '#2a2a2a';
+    wctx.font = '11px Share Tech Mono';
+    wctx.textAlign = 'center';
+    wctx.fillText('WAITING FOR SIGNAL…', W/2, H/2 + 4);
+    return;
+  }
+
+  // Compute display signal
+  const fps = N > 2 ? (N-1) / ((tBuf[N-1]-tBuf[0])/1000) : 30;
+  const show = Math.min(N, Math.round(fps * 8)); // last 8s
+  const raw  = gBuf.slice(-show);
+  const det  = detrend(raw, Math.round(fps * 2));
+  const mu   = det.reduce((a,b)=>a+b,0)/det.length;
+  const sd   = Math.sqrt(det.reduce((a,b)=>a+(b-mu)**2,0)/det.length) || 1;
+  const norm = det.map(v => (v-mu)/sd);
+
+  // Map samples to canvas x-positions
+  const step  = norm.length / W;
+  const yOf   = v => H/2 - (v / 4) * H * 0.85;
+
+  // Draw signal line
+  wctx.beginPath();
+  for (let px = 0; px < W; px++) {
+    const idx = Math.min(norm.length-1, Math.floor(px * step));
+    px === 0 ? wctx.moveTo(px, yOf(norm[idx])) : wctx.lineTo(px, yOf(norm[idx]));
+  }
+  const grad = wctx.createLinearGradient(0, 0, W, 0);
+  const goodSig = sqi > 0.4;
+  if (goodSig) {
+    grad.addColorStop(0, 'rgba(0,255,136,0)');
+    grad.addColorStop(.1, '#00ff88');
+    grad.addColorStop(1,  '#00ffaa');
+    wctx.shadowColor = '#00ff88';
+  } else {
+    grad.addColorStop(0, 'rgba(255,170,0,0)');
+    grad.addColorStop(.1, '#ffaa00');
+    grad.addColorStop(1,  '#ffaa00');
+    wctx.shadowColor = '#ffaa00';
+  }
+  wctx.strokeStyle = grad;
+  wctx.lineWidth   = 1.8;
+  wctx.shadowBlur  = 4;
+  wctx.stroke();
+  wctx.shadowBlur  = 0;
+
+  // Mark R-peaks
+  // lastPeaks indices are relative to norm (last useN samples),
+  // but norm here is last 'show' samples — map accordingly
+  const offset = Math.max(0, N - show);
+  const normOffset = Math.max(0, N - Math.min(N, Math.round(fps*10))) - offset;
+
+  lastPeaks.forEach(pi => {
+    const adjPi = pi + normOffset;
+    if (adjPi < 0 || adjPi >= norm.length) return;
+    const px = Math.round(adjPi / step);
+    const py = yOf(norm[adjPi]);
+    wctx.beginPath();
+    wctx.arc(px, py, 3.5, 0, Math.PI * 2);
+    wctx.fillStyle   = '#ff3355';
+    wctx.shadowColor = '#ff3355';
+    wctx.shadowBlur  = 7;
+    wctx.fill();
+    wctx.shadowBlur  = 0;
+  });
+}
+
+// ─────────────────────────────────────────────────────────
+//  UI UPDATE
+// ─────────────────────────────────────────────────────────
+function updateUI() {
+  const bpm = bpmSmooth;
+  const bpmR = bpm > 0 ? Math.round(bpm) : null;
+
+  // BPM value
+  const bv = document.getElementById('bpmVal');
+  bv.textContent = bpmR ?? '--';
+  bv.className   = 'bpm-val' + (bpmR ? (bpmR<60?' low':bpmR>100?' high':' normal') : '');
+
+  // Status
+  const bs = document.getElementById('bpmStat');
+  if (!calDone)        bs.textContent = '';
+  else if (!bpmR)      bs.textContent = 'ACQUIRING SIGNAL…';
+  else if (bpmR < 60)  bs.textContent = 'BRADYCARDIA RANGE';
+  else if (bpmR > 100) bs.textContent = 'TACHYCARDIA RANGE';
+  else                 bs.textContent = 'NORMAL RANGE';
+
+  // Meta cards
+  document.getElementById('hrvVal').textContent  = hrv > 0      ? Math.round(hrv)  : '--';
+  document.getElementById('confVal').textContent = bpm > 0      ? confidence        : '--';
+  document.getElementById('peakVal').textContent = peakCount > 0 ? peakCount        : '--';
+
+  // SQI label
+  const sqiEl = document.getElementById('sqiLabel');
+  const sqiPct = Math.round(sqi * 100);
+  sqiEl.textContent = `SQI: ${sqiPct}%`;
+  sqiEl.style.color  = sqi > 0.6 ? 'var(--green)' : sqi > 0.3 ? 'var(--amber)' : 'var(--red)';
+  sqiEl.style.borderColor = sqiEl.style.color;
+
+  // SQI bars (10 segments)
+  const colors = ['#ff3355','#ff5533','#ff7733','#ffaa00','#ffcc00','#ccee00','#88ee44','#44dd88','#00ff88','#00ffaa'];
+  const q10 = Math.round(sqi * 10);
+  for (let i = 0; i < 10; i++) {
+    document.getElementById('s'+i).style.background = i < q10 ? colors[i] : 'var(--border)';
+  }
+
+  // Beat animation
+  if (bpm > 0) {
+    const interval = 60000 / bpm;
+    const now = performance.now();
+    if (now - lastBeat > interval * 0.9) {
+      lastBeat = now;
+      const h = document.getElementById('heart');
+      h.style.setProperty('--beat-dur', (interval * 0.6 / 1000).toFixed(2) + 's');
+      h.classList.remove('beat');
+      void h.offsetWidth;
+      h.classList.add('beat');
+    }
+  }
+
+  // Calibration bar
+  if (!calDone && running) {
+    const N   = gBuf.length;
+    const fps = N > 2 ? (N-1)/((tBuf[N-1]-tBuf[0])/1000) : 30;
+    const pct = Math.min(100, (N / (fps * CAL_SECS)) * 100);
+    document.getElementById('calFill').style.width = pct + '%';
+    if (pct >= 100) {
+      calDone = true;
+      document.getElementById('cal').classList.add('gone');
+    } else {
+      document.getElementById('calMsg').textContent = 'CALIBRATING…';
+      document.getElementById('calSub').textContent = `Keep still · ${Math.round(pct/10)}s`;
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+//  MAIN LOOP
+// ─────────────────────────────────────────────────────────
+let loopN = 0;
+function loop(ts) {
+  if (!running) return;
+  raf = requestAnimationFrame(loop);
+
+  // FPS counter
+  fpsCount++;
+  if (ts - fpsLast >= 1000) { fpsCur = fpsCount; fpsCount = 0; fpsLast = ts; }
+
+  // Every frame: capture ROI
+  if (video.readyState >= 2) extractROI(ts);
+
+  loopN++;
+  // Process every 12 frames (~2.5×/sec at 30fps)
+  if (loopN % 12 === 0) process();
+  // Update UI + waveform every 5 frames (~6×/sec)
+  if (loopN % 5 === 0)  { drawWave(); updateUI(); }
+}
+
+// ─────────────────────────────────────────────────────────
+//  START / STOP
+// ─────────────────────────────────────────────────────────
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width:{ideal:640}, height:{ideal:480}, frameRate:{ideal:30}, facingMode:'user' },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+  } catch(e) { alert('Camera access failed:\n' + e.message); return; }
+
+  // Reset
+  gBuf=[]; tBuf=[]; prevRoi=null;
+  bpmSmooth=0; bpmHistory=[]; hrv=0; sqi=0; confidence=0; peakCount=0;
+  motionFlag=false; lastPeaks=[]; calDone=false; loopN=0; fpsCount=0; fpsLast=0;
+
+  document.getElementById('cal').classList.remove('gone');
+  document.getElementById('calMsg').textContent = 'CALIBRATING…';
+  document.getElementById('calSub').textContent = 'Keep forehead in box · stay still';
+  document.getElementById('calFill').style.width = '0%';
+  document.getElementById('startBtn').disabled = true;
+  document.getElementById('stopBtn').disabled  = false;
+  document.getElementById('heart').classList.remove('beat');
+
+  running = true;
+  raf = requestAnimationFrame(loop);
+}
+
+function stop() {
+  running = false;
+  if (raf) cancelAnimationFrame(raf);
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  video.srcObject = null;
+
+  gBuf=[]; tBuf=[]; bpmSmooth=0; bpmHistory=[]; hrv=0; sqi=0; confidence=0; peakCount=0;
+  motionFlag=false; lastPeaks=[];
+
+  document.getElementById('cal').classList.remove('gone');
+  document.getElementById('calMsg').textContent = 'STOPPED';
+  document.getElementById('calSub').textContent  = 'Click START to begin';
+  document.getElementById('calFill').style.width = '0%';
+  document.getElementById('startBtn').disabled = false;
+  document.getElementById('stopBtn').disabled  = true;
+  document.getElementById('heart').classList.remove('beat');
+  document.getElementById('bpmStat').textContent = '';
+
+  updateUI();
+  drawWave();
+}
+
+drawWave();
+</script>
+</body>
+</html>
